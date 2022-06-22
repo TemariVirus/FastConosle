@@ -1,4 +1,4 @@
-﻿using Microsoft.Win32.SafeHandles;
+using Microsoft.Win32.SafeHandles;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -40,7 +40,7 @@ static class FastConsole
         ref Rect lpWriteRegion);
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct Coord
+    struct Coord
     {
         public static readonly Coord Zero = new Coord(0, 0);
         public short X;
@@ -54,7 +54,7 @@ static class FastConsole
     };
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct Rect
+    struct Rect
     {
         public readonly short Left;
         public readonly short Top;
@@ -72,7 +72,7 @@ static class FastConsole
 
     // Returns false if it failed to grab the CONOUT$ file handle
     // Otherwise, returns true
-    static bool Initialise()
+    public static bool Initialise()
     {
         Width = (short)Console.BufferWidth;
         Height = (short)Console.BufferHeight;
@@ -84,14 +84,14 @@ static class FastConsole
     }
 
     // Sets the current window dimensions
-    static void SetWindow(int width, int height)
+    public static void SetWindow(int width, int height)
     {
         Console.WindowWidth = width;
         Console.WindowHeight = height;
     }
 
     // Sets the current buffer dimensions
-    static void SetBuffer(int width, int height)
+    public static void SetBuffer(int width, int height)
     {
         Console.BufferWidth = width;
         Console.BufferHeight = height;
@@ -109,7 +109,7 @@ static class FastConsole
     }
 
     // Sets the current window and buffer dimentions
-    static void Set(int window_width, int window_height, int buffer_width, int buffer_height)
+    public static void Set(int window_width, int window_height, int buffer_width, int buffer_height)
     {
         if (window_width > buffer_width || window_height > buffer_height)
         {
@@ -150,13 +150,13 @@ static class FastConsole
     }
 
     // Writes a string of text at the current cursor position
-    static void Write(string text)
+    public static void Write(string text)
     {
         WriteAt(text, Cursor_Left, Cursor_Top);
     }
 
     // Writes a string of text at the current cursor position and moves the cursor to the next line
-    static void WriteLine(string text)
+    public static void WriteLine(string text)
     {
         WriteAt(text, Cursor_Left, Cursor_Top);
         Cursor_Left = 0;
@@ -164,7 +164,7 @@ static class FastConsole
     }
 
     // Writes a string of text onto the x and y position of the screen buffer
-    static void WriteAt(string text, int x, int y, ConsoleColor foreground = ConsoleColor.White, ConsoleColor background = ConsoleColor.Black)
+    public static void WriteAt(string text, int x, int y, ConsoleColor foreground = ConsoleColor.White, ConsoleColor background = ConsoleColor.Black)
     {
         int index = y * Width + x;
         for (int i = 0; i < text.Length && index < Height * Width; i++, index++)
@@ -177,7 +177,7 @@ static class FastConsole
     }
 
     // Renders the contents of the screen buffer
-    static void Render()
+    public static void Render()
     {
         Rect rect = new Rect(0, 0, Width, Height);
         WriteConsoleOutputW(Conout_Handle, Screen_Buffer, new Coord(Width, Height), Coord.Zero, ref rect);
