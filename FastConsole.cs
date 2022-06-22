@@ -175,6 +175,12 @@ static class FastConsole
         Cursor_Left = cursor_pos % Width;
         Cursor_Top = cursor_pos / Width;
     }
+    
+    // Clears the screen buffer
+    public static void Clear()
+    {
+        Screen_Buffer = new int[Width * Height];
+    }
 
     // Renders the contents of the screen buffer
     public static void Render()
