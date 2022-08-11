@@ -1,25 +1,95 @@
 using Microsoft.Win32.SafeHandles;
+using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 static class FastConsole
 {
-    static short Width, Height;
-    public static int Cursor_Left = 0, Cursor_Top = 0;
-    static int[] Screen_Buffer;
-    static SafeFileHandle Conout_Handle;
+    #region // Font
+    private const int FixedWidthTrueType = 54;
+    private const int StandardOutputHandle = -11;
 
-    static void Main(string[] args)
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern bool SetCurrentConsoleFontEx(IntPtr hConsoleOutput, bool MaximumWindow, ref FontInfo ConsoleCurrentFontEx);
+
+    [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern bool GetCurrentConsoleFontEx(IntPtr hConsoleOutput, bool MaximumWindow, ref FontInfo ConsoleCurrentFontEx);
+
+
+    private static readonly IntPtr ConsoleOutputHandle = GetStdHandle(StandardOutputHandle);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct FontInfo
     {
-        if (!Initialise()) return;
-
-        // write whatever u want
-        WriteAt("asdasd", 10, 6);
-        Render();
-        
-        // to stop the text at the end from covering up what u wrote
-        Console.ReadKey(true);
+        internal int cbSize;
+        internal int FontIndex;
+        internal short FontWidth;
+        public short FontSize;
+        public int FontFamily;
+        public int FontWeight;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        //[MarshalAs(UnmanagedType.ByValArray, ArraySubType = UnmanagedType.wc, SizeConst = 32)]
+        public string FontName;
     }
+
+    public static FontInfo[] SetCurrentFont(string font, short fontSize = 0)
+    {
+        FontInfo before = new FontInfo
+        {
+            cbSize = Marshal.SizeOf<FontInfo>()
+        };
+
+        if (GetCurrentConsoleFontEx(ConsoleOutputHandle, false, ref before))
+        {
+
+            FontInfo set = new FontInfo
+            {
+                cbSize = Marshal.SizeOf<FontInfo>(),
+                FontIndex = 0,
+                FontFamily = FixedWidthTrueType,
+                FontName = font,
+                FontWeight = 400,
+                FontSize = fontSize > 0 ? fontSize : before.FontSize
+            };
+
+            // Get some settings from current font.
+            if (!SetCurrentConsoleFontEx(ConsoleOutputHandle, false, ref set))
+            {
+                var ex = Marshal.GetLastWin32Error();
+                Console.WriteLine("Error setting font: " + ex);
+                throw new System.ComponentModel.Win32Exception(ex);
+            }
+
+            FontInfo after = new FontInfo
+            {
+                cbSize = Marshal.SizeOf<FontInfo>()
+            };
+            GetCurrentConsoleFontEx(ConsoleOutputHandle, false, ref after);
+
+            return new[] { before, set, after };
+        }
+        else
+        {
+            var er = Marshal.GetLastWin32Error();
+            Console.WriteLine("Get error " + er);
+            throw new System.ComponentModel.Win32Exception(er);
+        }
+    }
+    #endregion
+
+    private static int Width, Height;
+    private static int XOffset, YOffset;
+    public static bool CursorVisible = false;
+    public static int CursorLeft = 0, CursorTop = 0;
+    public static float Framerate;
+    static int[] ConsoleBuffer;
+    static SafeFileHandle ConoutHandle;
 
     [DllImport("Kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     static extern SafeFileHandle CreateFile(
@@ -46,10 +116,10 @@ static class FastConsole
         public short X;
         public short Y;
 
-        public Coord(short _x, short _y)
+        public Coord(int _x, int _y)
         {
-            X = _x;
-            Y = _y;
+            X = (short)_x;
+            Y = (short)_y;
         }
     };
 
@@ -76,25 +146,70 @@ static class FastConsole
     {
         Width = (short)Console.BufferWidth;
         Height = (short)Console.BufferHeight;
-        Screen_Buffer = new int[Width * Height];
+
+        ConsoleBuffer = new int[Width * Height];
         Console.OutputEncoding = System.Text.Encoding.Unicode;
 
-        Conout_Handle = CreateFile("CONOUT$", 0x40000000, 2, IntPtr.Zero, FileMode.Open, 0, IntPtr.Zero);
-        return !Conout_Handle.IsInvalid;
+        ConoutHandle = CreateFile("CONOUT$", 0x40000000, 2, IntPtr.Zero, FileMode.Open, 0, IntPtr.Zero);
+        return !ConoutHandle.IsInvalid;
     }
 
-    // Sets the current window dimensions
+    public static void ConsoleUpdateLoop()
+    {
+        if (!Initialise()) throw new Exception("Failed to initialise console!");
+
+        while (true)
+        {
+            try
+            {
+                Console.BufferWidth = Math.Max(Width, Console.WindowWidth);
+                Console.BufferHeight = Math.Max(Height, Console.WindowHeight);
+            }
+            catch { }
+            int old_xoffset = XOffset, old_yoffset = YOffset;
+            XOffset = (Console.WindowWidth - Width) / 2;
+            YOffset = (Console.WindowHeight - Height) / 2;
+            Console.CursorVisible = CursorVisible;
+            if (old_xoffset != XOffset || old_yoffset != YOffset)
+            {
+                // Fill the whole buffer with black
+                int width = Console.BufferWidth, height = Console.BufferHeight;
+                int[] the_void = new int[width * height];
+                Rect void_rect = new Rect(0, 0, width, height);
+                WriteConsoleOutputW(ConoutHandle, the_void, new Coord((short)width, (short)height), Coord.Zero, ref void_rect);
+            }
+            Render();
+            Thread.Sleep((int)(1000 / Framerate));
+        }
+    }
+
     public static void SetWindow(int width, int height)
     {
         Console.WindowWidth = width;
         Console.WindowHeight = height;
     }
 
-    // Sets the current buffer dimensions
     public static void SetBuffer(int width, int height)
     {
         Console.BufferWidth = width;
         Console.BufferHeight = height;
+        ResizeBuffer(width, height);
+    }
+
+    public static void Set(int window_width, int window_height, int buffer_width, int buffer_height)
+    {
+        if (window_width <= Console.BufferWidth) Console.WindowWidth = window_width;
+        Console.BufferWidth = buffer_width;
+        Console.WindowWidth = window_width;
+        if (window_height <= Console.BufferHeight) Console.WindowHeight = window_height;
+        Console.BufferHeight = buffer_height;
+        Console.WindowHeight = window_height;
+
+        ResizeBuffer(buffer_width, buffer_height);
+    }
+
+    static void ResizeBuffer(int width, int height)
+    {
         int old_width = Width, old_height = Height;
         Width = (short)width;
         Height = (short)height;
@@ -102,90 +217,43 @@ static class FastConsole
         int[] new_buff = new int[Width * Height];
         int min_height = Math.Min(Height, old_height), min_width = Math.Min(Width, old_width);
         for (int i = 0; i < min_height; i++)
-        {
-            Buffer.BlockCopy(Screen_Buffer, 4 * i * old_width, new_buff, 4 * i * Width, 4 * min_width);
-        }
-        Screen_Buffer = new_buff;
+            Buffer.BlockCopy(ConsoleBuffer, sizeof(int) * i * old_width, new_buff, sizeof(int) * i * Width, sizeof(int) * min_width);
+        ConsoleBuffer = new_buff;
     }
 
-    // Sets the current window and buffer dimentions
-    public static void Set(int window_width, int window_height, int buffer_width, int buffer_height)
-    {
-        if (window_width > buffer_width || window_height > buffer_height)
-        {
-            throw new ArgumentException("Window dimensions must not exceed buffer dimensions");
-        }
-
-        if (window_width <= Width)
-        {
-            Console.WindowWidth = window_width;
-            Console.BufferWidth = buffer_width;
-        }
-        else
-        {
-            Console.BufferWidth = buffer_width;
-            Console.WindowWidth = window_width;
-        }
-        if (window_height <= Height)
-        {
-            Console.WindowHeight = window_height;
-            Console.BufferHeight = buffer_height;
-        }
-        else
-        {
-            Console.BufferHeight = buffer_height;
-            Console.WindowHeight = window_height;
-        }
-        int old_width = Width, old_height = Height;
-        Width = (short)buffer_width;
-        Height = (short)buffer_height;
-        // Create a new screen buffer and copy characters from the old one
-        int[] new_buff = new int[Width * Height];
-        int min_height = Math.Min(Height, old_height), min_width = Math.Min(Width, old_width);
-        for (int i = 0; i < min_height; i++)
-        {
-            Buffer.BlockCopy(Screen_Buffer, 4 * i * old_width, new_buff, 4 * i * Width, 4 * min_width);
-        }
-        Screen_Buffer = new_buff;
-    }
-
-    // Writes a string of text at the current cursor position
     public static void Write(string text)
     {
-        WriteAt(text, Cursor_Left, Cursor_Top);
+        WriteAt(text, CursorLeft, CursorTop);
     }
 
-    // Writes a string of text at the current cursor position and moves the cursor to the next line
     public static void WriteLine(string text)
     {
-        WriteAt(text, Cursor_Left, Cursor_Top);
-        Cursor_Left = 0;
-        Cursor_Top = Math.Min(Cursor_Top + 1, Width - 1);
+        WriteAt(text, CursorLeft, CursorTop);
+        CursorLeft = 0;
+        CursorTop = Math.Min(CursorTop + 1, Width - 1);
     }
 
-    // Writes a string of text onto the x and y position of the screen buffer
     public static void WriteAt(string text, int x, int y, ConsoleColor foreground = ConsoleColor.White, ConsoleColor background = ConsoleColor.Black)
     {
         int index = y * Width + x;
         for (int i = 0; i < text.Length && index < Height * Width; i++, index++)
         {
-            Screen_Buffer[index] = text[i] | ((int)foreground << 16) | ((int)background << 20);
+            // might need to do checks for tab, return and newline?
+            ConsoleBuffer[index] = text[i] | ((int)foreground << 16) | ((int)background << 20);
         }
-        int cursor_pos = Math.Min(index, Screen_Buffer.Length - 1);
-        Cursor_Left = cursor_pos % Width;
-        Cursor_Top = cursor_pos / Width;
-    }
-    
-    // Clears the screen buffer
-    public static void Clear()
-    {
-        Screen_Buffer = new int[Width * Height];
+        int cursor_pos = Math.Min(index, ConsoleBuffer.Length - 1);
+        CursorLeft = cursor_pos % Width;
+        CursorTop = cursor_pos / Width;
     }
 
-    // Renders the contents of the screen buffer
-    public static void Render()
+    public static void Clear()
     {
-        Rect rect = new Rect(0, 0, Width, Height);
-        WriteConsoleOutputW(Conout_Handle, Screen_Buffer, new Coord(Width, Height), Coord.Zero, ref rect);
+        ConsoleBuffer = new int[Width * Height];
+    }
+
+    static void Render()
+    {
+        Rect rect = new Rect(XOffset, YOffset, XOffset + Width, YOffset + Height);
+        WriteConsoleOutputW(ConoutHandle, ConsoleBuffer, new Coord(Width, Height), Coord.Zero, ref rect);
     }
 }
