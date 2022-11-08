@@ -1,11 +1,12 @@
-using Microsoft.Win32.SafeHandles;
 using System;
 using System.Collections.Generic;
+using Microsoft.Win32.SafeHandles;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Threading;
+using System.Text;
 using System.Windows.Input;
+using System.Windows.Threading;
 
 static class FastConsole
 {
@@ -17,6 +18,8 @@ static class FastConsole
     static Action RenderCallback;
     static Action InputLoopCallback;
 
+    public static Thread SwitchFocusThread { get; private set; }
+
     // Throws an exception if it failed to grab the CONOUT$ file handle
     // Otherwise, starts the console update loop on a separate thread
     // The callback is called at the end of each frame
@@ -27,22 +30,37 @@ static class FastConsole
         if (ConoutHandle.IsInvalid) throw new System.ComponentModel.Win32Exception();
         else
         {
+            // Rendering
             Width = (short)Console.BufferWidth;
             Height = (short)Console.BufferHeight;
             Console.CursorVisible = CursorVisible;
             ConsoleBuffer = new int[Width * Height];
-            Console.OutputEncoding = System.Text.Encoding.Unicode;
+            Console.OutputEncoding = Encoding.Unicode;
             RenderThread = new Thread(RenderLoop);
             RenderCallback = renderCallback;
+            RenderThread.Priority = ThreadPriority.Lowest;
             RenderThread.Start();
 
+            // Check for focus switching
+            SwitchFocusThread = new Thread(() =>
+            {
+                SwitchFocusDelegate = new WinEventDelegate((_, _, _, _, _, _, _) => IsFocused = WindowIsFocused());
+                IntPtr m_hhook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, SwitchFocusDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
+                Dispatcher.Run();
+            });
+            SwitchFocusThread.Priority = ThreadPriority.Lowest;
+            SwitchFocusThread.Start();
+            IsFocused = WindowIsFocused();
+
+            // Input
             InputThread = new Thread(InputLoop);
             InputThread.SetApartmentState(ApartmentState.STA);
             InputLoopCallback = inputCallback;
+            InputThread.Priority = ThreadPriority.Lowest;
             InputThread.Start();
         }
     }
-   
+
     #region // Font
     private const int FixedWidthTrueType = 54;
     private const int StandardOutputHandle = -11;
@@ -57,7 +75,6 @@ static class FastConsole
     [return: MarshalAs(UnmanagedType.Bool)]
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     internal static extern bool GetCurrentConsoleFontEx(IntPtr hConsoleOutput, bool MaximumWindow, ref FontInfo ConsoleCurrentFontEx);
-
 
     private static readonly IntPtr ConsoleOutputHandle = GetStdHandle(StandardOutputHandle);
 
@@ -121,7 +138,8 @@ static class FastConsole
     #endregion
 
     #region // Rendering
-    private static int Width, Height;
+    public static int Width { get; private set; }
+    public static int Height { get; private set; }
     private static int XOffset, YOffset;
     private static bool _CursorVisible = true;
     public static bool CursorVisible
@@ -129,11 +147,8 @@ static class FastConsole
         get => _CursorVisible;
         set
         {
-            if (_CursorVisible != value)
-            {
-                _CursorVisible = value;
-                Console.CursorVisible = value;
-            }
+            _CursorVisible = value;
+            Console.CursorVisible = value;
         }
     }
     public static int CursorLeft = 0, CursorTop = 0;
@@ -213,8 +228,9 @@ static class FastConsole
                 int[] the_void = new int[width * height];
                 Rect void_rect = new Rect(0, 0, width, height);
                 WriteConsoleOutputW(ConoutHandle, the_void, new Coord((short)width, (short)height), Coord.Zero, ref void_rect);
+                // Reset cursor visibility
+                Console.CursorVisible = CursorVisible;
             }
-            ForceRender();
 
             // Write fps
             long newT = Time.ElapsedTicks;
@@ -223,6 +239,7 @@ static class FastConsole
             if (times.Count > Framerate) oldT = times.Dequeue();
             else oldT = times.Peek();
             WriteAt($"{(float)(times.Count - 1) / (newT - oldT) * Stopwatch.Frequency}fps".PadRight(12), 0, 0);
+            ForceRender();
 
             // Callback
             RenderCallback?.Invoke();
@@ -252,26 +269,32 @@ static class FastConsole
         if (width != Width || height != Height) ResizeBuffer(width, height);
     }
 
+    public static void Set(int width, int height) => Set(width, height, width, height);
+
     public static void Set(int window_width, int window_height, int buffer_width, int buffer_height)
     {
         try
         {
             if (window_width <= Console.BufferWidth) Console.WindowWidth = window_width;
-        } catch { }
+        }
+        catch { }
         if (buffer_width != Width) Console.BufferWidth = buffer_width;
         try
         {
             Console.WindowWidth = window_width;
-        } catch {}
+        }
+        catch { }
         try
         {
             if (window_height <= Console.BufferHeight) Console.WindowHeight = window_height;
-        } catch { }
+        }
+        catch { }
         if (buffer_height != Height) Console.BufferHeight = buffer_height;
         try
         {
             Console.WindowHeight = window_height;
-        } catch { }
+        }
+        catch { }
 
         if (buffer_width != Width || buffer_height != Height)
             ResizeBuffer(buffer_width, buffer_height);
@@ -295,24 +318,60 @@ static class FastConsole
         WriteAt(text, CursorLeft, CursorTop);
     }
 
+    public static void Write(object obj)
+    {
+        WriteAt(obj.ToString(), CursorLeft, CursorTop);
+    }
+
+    public static void WriteLine()
+    {
+        Write("\n");
+    }
+
     public static void WriteLine(string text)
     {
-        WriteAt(text, CursorLeft, CursorTop);
-        CursorLeft = 0;
-        CursorTop = Math.Min(CursorTop + 1, Width - 1);
+        Write(text + '\n');
+    }
+
+    public static void WriteLine(object obj)
+    {
+        Write(obj.ToString() + '\n');
     }
 
     public static void WriteAt(string text, int x, int y, ConsoleColor foreground = ConsoleColor.White, ConsoleColor background = ConsoleColor.Black)
     {
-        int index = y * Width + x;
-        for (int i = 0; i < text.Length && index < Height * Width; i++, index++)
+        int pos = y * Width + x;
+        for (int i = 0; i < text.Length && pos < Height * Width; i++, pos++)
         {
             // might need to do checks for tab, return and newline?
-            ConsoleBuffer[index] = text[i] | ((int)foreground << 16) | ((int)background << 20);
+            if (text[i] == '\t')
+            {
+                int space_end = pos + 8 - (pos % Width % 8);
+                for (; pos < space_end && pos < Height * Width; pos++)
+                    ConsoleBuffer[pos] = ' ' | ((int)foreground << 16) | ((int)background << 20);
+            }
+            else if (text[i] == '\r')
+            {
+                pos -= pos % Width;
+            }
+            else if (text[i] == '\n')
+            {
+                pos -= pos % Width;
+                pos += Width - 1;
+            }
+            else
+            {
+                ConsoleBuffer[pos] = text[i] | ((int)foreground << 16) | ((int)background << 20);
+            }
         }
-        int cursor_pos = Math.Min(index, ConsoleBuffer.Length - 1);
+        int cursor_pos = Math.Min(pos, ConsoleBuffer.Length - 1);
         CursorLeft = cursor_pos % Width;
         CursorTop = cursor_pos / Width;
+    }
+
+    public static void WriteAt(object obj, int x, int y, ConsoleColor foreground = ConsoleColor.White, ConsoleColor background = ConsoleColor.Black)
+    {
+        WriteAt(obj.ToString(), x, y, foreground, background);
     }
 
     public static void Clear()
@@ -390,9 +449,28 @@ static class FastConsole
 
     private static readonly List<KeyListener> KeyListeners = new List<KeyListener>();
 
+    private static bool IsFocused;
+
+    private static WinEventDelegate SwitchFocusDelegate;
+    delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+    private const uint WINEVENT_OUTOFCONTEXT = 0;
+    private const uint EVENT_SYSTEM_FOREGROUND = 3;
+
+    [DllImport("user32.dll")]
+    static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+
     private static void InputLoop()
     {
-        Queue<long> times = new Queue<long>();
         while (true)
         {
             long time = Time.ElapsedTicks;
@@ -401,15 +479,19 @@ static class FastConsole
                 if (KeyListeners[i] != null)
                     if (KeyListeners[i].Remove)
                         KeyListeners.RemoveAt(i--);
-            // Check for key events
-            for (int i = 0; i < KeyListeners.Count; i++)
-                KeyListeners[i]?.Check();
 
-            // Callback function
-            InputLoopCallback?.Invoke();
+            if (IsFocused)
+            {
+                // Check for key events
+                for (int i = 0; i < KeyListeners.Count; i++)
+                    KeyListeners[i].Check();
+
+                // Callback function
+                InputLoopCallback?.Invoke();
+            }
 
             // Try to get ~2000 loops per second, since the smallest precision is a millisecond
-            while (Time.ElapsedTicks - time < Stopwatch.Frequency / 2400) Thread.Sleep(0);
+            while (Time.ElapsedTicks - time < Stopwatch.Frequency / 2100) Thread.Sleep(0);
         }
     }
 
@@ -452,6 +534,12 @@ static class FastConsole
         }
     }
 
+    public static void RemoveAllListeners()
+    {
+        for (int i = 0; i < KeyListeners.Count; i++)
+            KeyListeners[i].Remove = true;
+    }
+
     public static void RemoveAllListeners(Key key)
     {
         for (int i = 0; i < KeyListeners.Count; i++)
@@ -467,5 +555,16 @@ static class FastConsole
 
     public static void RemoveOnHoldListeners(Key key) =>
         RemoveListeners(key, true, true);
+
+    public static bool WindowIsFocused()
+    {
+        IntPtr handle = GetForegroundWindow();
+        StringBuilder sb = new StringBuilder(256);
+
+        if (GetWindowText(handle, sb, 256) > 0)
+            return sb.ToString() == Console.Title;
+
+        return false;
+    }
     #endregion
 }
